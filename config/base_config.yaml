@@ -61,7 +61,7 @@ train:
   num_workers: 4
   n_crop: 600  # 裁剪长度（包括配体）。使用36+4层时，4090(24 G)推荐设置为384，5090推荐设置为455
   p2p_crop: -1
-  crop_max_dist: 20.  # 按照残基距离裁剪时的最大距离（以CA原子为准）
+  crop_max_dist: 20.  # 按照残基距离裁剪时的最大距离（以CA原子为基准）
   epochs: 100
   gpu_nums: 4
   batch_size: 32

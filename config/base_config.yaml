@@ -1,0 +1,87 @@
+model:
+  params:
+    d_t1d: 73  # token + 序列置信度 + 结构置信度 + 热点区域
+    d_t2d: 68
+    n_extra_block: 4
+    n_main_block: 16
+    n_ref_block: 4
+    n_finetune_block: 0
+    d_msa: 256
+    d_msa_full: 64
+    d_pair: 192
+    d_templ: 64
+    n_head_msa: 8
+    n_head_pair: 6
+    n_head_templ: 4
+    d_hidden: 32
+    d_hidden_templ: 64
+    d_time_emb: 64
+    p_drop: 0.15
+    SE3_PARAM:
+      num_layers: 1
+      num_channels: 32
+      num_degrees: 2
+      l0_in_features: 64  # 实际上为Str2Str模块中的节点嵌入维度
+      l0_out_features: 64
+      l1_in_features: 3
+      l1_out_features: 2
+      num_edge_features: 64
+      n_heads: 4
+      div: 4
+    SE3_REF_PARAM:
+      num_layers: 2
+      num_channels: 32
+      num_degrees: 2
+      l0_in_features: 64
+      l0_out_features: 64
+      l1_in_features: 3
+      l1_out_features: 2
+      num_edge_features: 64
+      n_heads: 4
+      div: 4
+  topk_crop: 128
+  use_holo: False
+  atomize_protein: True
+  n_cycle: 4
+  interpolant:
+    min_t: 1.e-2
+    t_normalization_clip: 0.9
+    position_scale: 0.25  # 是否需要缩放？
+
+dataset:
+  base_path: /root/autodl-tmp/dataset/APO2MolFlow
+  PDBBind_path: /root/autodl-tmp/dataset/PDBbind+
+  Q_BioLip_path: /root/autodl-tmp/dataset/Q-BioLiP
+  apo_holo_dict: /root/autodl-tmp/dataset/APO2MolFlow/use_single_apo_holo_dict.pkl
+  holo_path: /root/autodl-tmp/dataset/APO2MolFlow/holo
+  apo_path: /root/autodl-tmp/dataset/APO2MolFlow/apo
+
+train:
+  seed: 2026
+  num_workers: 4
+  n_crop: 600  # 裁剪长度（包括配体）。使用36+4层时，4090(24 G)推荐设置为384，5090推荐设置为455
+  p2p_crop: -1
+  crop_max_dist: 20.  # 按照残基距离裁剪时的最大距离（以CA原子为准）
+  epochs: 100
+  gpu_nums: 4
+  batch_size: 32
+  pseudo_batch_size: 8
+  mini_batch_size: 1
+  l2_coeff: 1.e-2
+  lr: 5.e-4
+  grad_clip: 0.2
+  rfaa_weight_pth: /root/pytorch_checkpoint/RFAA_paper_weights.pt
+  predict_weight: 0.3
+  use_aux_loss: 0.5
+  loss_weight:
+    gamma: 0.99
+    sm_token: 1.0
+    bond_token: 1.0
+    allatom_fape: 0.2
+    frame_distance: 1.
+    tors: 1.0
+    protein_geometry: 0.02
+    ligand_coords: 1.0
+    ligand_geometry: 0.02
+    c6d: 1.0
+    plddt: 0.1

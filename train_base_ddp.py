@@ -83,7 +83,7 @@ def train(local_rank):
         # torch.cuda.set_rng_state_all(checkpoint['cuda_rng_state'])  # 恢复所有GPU的随机状态
         del checkpoint
     else:
-        model = utils.load_rfaa_weights_without_nucleic_acids(model, config['train']['rfaa_weight_pth'])  # 继承RFAA的权重
+        # model = utils.load_rfaa_weights_without_nucleic_acids(model, config['train']['rfaa_weight_pth'])  # 继承RFAA的权重
         epoch = 0
         log_steps = 1
         log_name = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -92,17 +92,16 @@ def train(local_rank):
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False, gradient_as_bucket_view=True)  # DDP包装
     dist.barrier()
 
-    dataset = Apo2HoloDataset(base_path=config['dataset']['base_path'], apo_holo_dict=config['dataset']['apo_holo_dict'],
-                              apo_path=config['dataset']['apo_path'], holo_path=config['dataset']['holo_path'],
-                              holo_list_path=config['dataset']['base_path'] + '/use_holo_ids_filter_mw.pkl', n_crop=config['train']['n_crop'],
-                              atomize_protein=config['model']['atomize_protein'])
+    dataset = Apo2HoloDataset(base_path=config['dataset']['base_path'], apo_path=config['dataset']['apo_path'],
+                              holo_path=config['dataset']['holo_path'], holo_list_path=config['dataset']['base_path'] + '/use_holo_ids_filter_mw.pkl',
+                              n_crop=config['train']['n_crop'], atomize_protein=config['model']['atomize_protein'])
     sampler = DistributedSampler(dataset, shuffle=True, num_replicas=WORLD_SIZE, rank=local_rank)  # 分布式采样器
 
     batch_size = config.train.batch_size
     data_total = len(dataset)
 
-    num_workers = 4
-    # num_workers = config.train.pseudo_batch_size
+    # num_workers = 4
+    num_workers = config.train.num_workers
     dataloader = DataLoader(dataset, batch_size=config.train.mini_batch_size, pin_memory=True, persistent_workers=True,
                             num_workers=num_workers, prefetch_factor=config.train.pseudo_batch_size, sampler=sampler)
 
@@ -199,12 +198,12 @@ def train(local_rank):
             pair_prev = None
             state_prev = None
 
-            n = torch.randint(1, n_cycle + 1, (1,), device=local_rank)
+            n = torch.randint(0, n_cycle - 1, (1,), device=local_rank)  # 若n=1，模型运行1次，实际上不会回收特征
             dist.broadcast(n, src=0)  # 同步特征回收次数
             # xyzs_prev = xyzs_prev * config['model']['position_scale']  # 坐标缩放
             with torch.no_grad():
                 with model.no_sync():
-                    for n in range(n_cycle):
+                    for n in range(n):
                         msa_prev, pair_prev, state_prev, _, _ = model(
                             t=xt['t'], msa_latent=pdb_data['seq']['msa_latent'], msa_full=pdb_data['seq']['msa_full'], seq=xt['seq_token_xt'],
                             seq1hot=xt['seq_xt'], bond_noisy=xt['bond_xt_logtis'], xyz=xyzs_prev, alpha=xt['chi_t'], idx=pdb_data['idx'], bond_feats=xt['bond_xt'],

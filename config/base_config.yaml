@@ -58,10 +58,13 @@ dataset:
 
 train:
   seed: 2026
-  num_workers: 4
+  num_workers: 8
   n_crop: 600  # 裁剪长度（包括配体）。使用36+4层时，4090(24 G)推荐设置为384，5090推荐设置为455
   p2p_crop: -1
   crop_max_dist: 20.  # 按照残基距离裁剪时的最大距离（以CA原子为基准）
+  # random_non_pocket：触发裁剪时，随机抽取除口袋区域外的残基
+  # distance：裁剪会强烈偏向口袋附近残基
+  crop_strategy: random_non_pocket
   epochs: 100
   gpu_nums: 4
   batch_size: 32

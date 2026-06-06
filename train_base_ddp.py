@@ -63,7 +63,7 @@ def train(local_rank):
     # 为不同的网络层设置相应的权重衰减
     param_group = util_module.add_weight_decay(model, l2_coeff=config.train.l2_coeff)
     optimizer = apex.optimizers.FusedAdam(param_group, lr=config.train.lr, set_grad_none=True)
-    scheduler = get_stepwise_decay_schedule_with_warmup(optimizer, 0, 1000, 0.95)
+    scheduler = get_stepwise_decay_schedule_with_warmup(optimizer, 0, 2000, 0.95)
 
     interpolant = Interpolant(device=local_rank).to(local_rank)  # 用于对数据进行插值
     # 计算所有原子坐标的工具
@@ -83,7 +83,7 @@ def train(local_rank):
         # torch.cuda.set_rng_state_all(checkpoint['cuda_rng_state'])  # 恢复所有GPU的随机状态
         del checkpoint
     else:
-        # model = utils.load_rfaa_weights_without_nucleic_acids(model, config['train']['rfaa_weight_pth'])  # 继承RFAA的权重
+        model = utils.load_rfaa_weights_without_nucleic_acids(model, config['train']['rfaa_weight_pth'])  # 继承RFAA的权重
         epoch = 0
         log_steps = 1
         log_name = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -94,7 +94,8 @@ def train(local_rank):
 
     dataset = Apo2HoloDataset(base_path=config['dataset']['base_path'], apo_path=config['dataset']['apo_path'],
                               holo_path=config['dataset']['holo_path'], holo_list_path=config['dataset']['base_path'] + '/use_holo_ids_filter_mw.pkl',
-                              n_crop=config['train']['n_crop'], atomize_protein=config['model']['atomize_protein'])
+                              n_crop=config['train']['n_crop'], atomize_protein=config['model']['atomize_protein'],
+                              crop_strategy=config['train']['crop_strategy'])
     sampler = DistributedSampler(dataset, shuffle=True, num_replicas=WORLD_SIZE, rank=local_rank)  # 分布式采样器
 
     batch_size = config.train.batch_size
@@ -396,9 +397,14 @@ def train(local_rank):
                         batch_ligand_rigid_loss, batch_ligand_chiral_loss, n_ligand_chiral, batch_c6d_loss, batch_lddt,
                         batch_pocket_lddt, batch_plddt, batch_plddt_loss
                     ]
-                # 对所有损失变量进行跨进程求和
-                for var in loss_vars:
-                    dist.all_reduce(var, op=dist.ReduceOp.SUM)
+                # 合并所有标量后只进行一次跨进程同步，减少通信调用次数
+                reduced_loss_vars = torch.stack(loss_vars)
+                dist.all_reduce(reduced_loss_vars, op=dist.ReduceOp.SUM)
+                batch_total_loss, batch_sm_token_loss, batch_bond_loss, batch_allatom_fape_loss, batch_protein_sm_fape_loss, \
+                    batch_sm_protein_fape_loss, batch_protein_trans_loss, batch_protein_rots_loss, batch_tors_loss, \
+                    batch_protein_blen_loss, batch_protein_bang_loss, batch_ligand_coords_loss, batch_ligand_bond_loss, \
+                    batch_ligand_rigid_loss, batch_ligand_chiral_loss, n_ligand_chiral, batch_c6d_loss, batch_lddt, \
+                    batch_pocket_lddt, batch_plddt, batch_plddt_loss = reduced_loss_vars.unbind()
 
                 # 主进程记录日志
                 if local_rank == 0:

@@ -41,7 +41,7 @@ ligand_covalent_bond：用于标记配体和蛋白质残基的共价连接信息
 
 class Apo2HoloDataset(Dataset):
     def __init__(self, base_path, apo_path, holo_path, holo_list_path, n_crop=384, crop_max_dist=20., atomize_protein=True,
-                 use_holo=False):
+                 use_holo=False, crop_strategy='random_non_pocket'):
         super(Apo2HoloDataset, self).__init__()
         self.holo_ids = pickle.load(open(holo_list_path, 'rb'))  # 使用预保存的id列表，防止因为字典的无序性导致训练结果不一样
         self.base_path = base_path
@@ -52,6 +52,7 @@ class Apo2HoloDataset(Dataset):
         self.n_crop = n_crop
         self.crop_max_dist = crop_max_dist
         self.use_holo = use_holo
+        self.crop_strategy = crop_strategy
         with gzip.open(base_path + '/ligands.json.gz', 'rt') as file:
             self.mols = json.load(file)  # 用于处理共价结合的蛋白质侧的残基
 
@@ -456,10 +457,17 @@ class Apo2HoloDataset(Dataset):
 
         if seq.shape[0] > self.n_crop:
             # keep_mask = pocket_based_crop(holo_pt['aa_token'].shape[0], holo_pt['pocket_res'], chain_lengths, self.n_crop - sm_xyzs_mask.shape[0])
-            pocket_center = xyzs_true[pocket_res_nb, 1].mean(dim=0)
-            keep_mask = pocket_CA_crop(xyzs_true[is_protein, 1], pocket_center, max_residues=self.n_crop - sm_xyzs_mask.shape[0],
-                                       radius=self.crop_max_dist)  # 获取保留残基的掩码
-            keep_mask = torch.concat([keep_mask, torch.ones(sm_xyzs_mask.shape[0]).bool()])  # 配体部分全部保留
+            max_protein_residues = self.n_crop - sm_xyzs_mask.shape[0]
+            if self.crop_strategy == 'random_non_pocket':
+                # 口袋残基全部保留，非口袋残基随机补足
+                keep_mask = pocket_random_crop(xyzs_true[is_protein, 1].shape[0], pocket_res_nb, max_residues=max_protein_residues)
+            elif self.crop_strategy == 'distance':
+                pocket_center = xyzs_true[pocket_res_nb, 1].mean(dim=0)
+                keep_mask = pocket_CA_crop(xyzs_true[is_protein, 1], pocket_center, max_residues=max_protein_residues,
+                                           radius=self.crop_max_dist)  # 获取保留残基的掩码
+            else:
+                raise ValueError("crop_strategy must be 'random_non_pocket' or 'distance'")
+            keep_mask = torch.concat([keep_mask, torch.ones(sm_xyzs_mask.shape[0], dtype=torch.bool, device=keep_mask.device)])  # 配体部分全部保留
             data_dict = self._keep_feature(data_dict, keep_mask)
 
         c6d = xyz_to_c6d(data_dict['xyzs']['xyzs_true'][None])
@@ -561,6 +569,36 @@ def pocket_CA_crop(protein_ca_xyz, pocket_center, radius=20.0, max_residues=384,
         return expanded_mask
 
     return expanded_mask
+
+
+def pocket_random_crop(num_res, pocket_indices, max_residues=384):
+    """
+    保留全部口袋残基，并从非口袋残基中随机补足到目标数量。
+    :param num_res: 蛋白质残基总数
+    :param pocket_indices: 口袋残基索引
+    :param max_residues: 目标保留的蛋白质残基数量
+    :return: (num_res,) 裁剪掩码
+    """
+    keep_mask = torch.zeros(num_res, dtype=torch.bool, device=pocket_indices.device)
+    if num_res == 0:
+        return keep_mask
+
+    valid_pocket_indices = pocket_indices[(pocket_indices >= 0) & (pocket_indices < num_res)].long()
+    keep_mask[valid_pocket_indices] = True
+
+    current_selected = keep_mask.sum().item()
+    if current_selected >= max_residues:
+        return keep_mask
+
+    num_to_add = min(max_residues - current_selected, num_res - current_selected)
+    if num_to_add <= 0:
+        return keep_mask
+
+    non_pocket_indices = torch.nonzero(~keep_mask, as_tuple=False).reshape(-1)
+    random_indices = torch.randperm(non_pocket_indices.shape[0], device=non_pocket_indices.device)[:num_to_add]
+    keep_mask[non_pocket_indices[random_indices]] = True
+
+    return keep_mask
 
 
 if __name__ == '__main__':

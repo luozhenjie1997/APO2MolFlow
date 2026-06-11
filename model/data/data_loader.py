@@ -41,7 +41,7 @@ ligand_covalent_bond：用于标记配体和蛋白质残基的共价连接信息
 
 class Apo2HoloDataset(Dataset):
     def __init__(self, base_path, apo_path, holo_path, holo_list_path, n_crop=384, crop_max_dist=20., atomize_protein=True,
-                 use_holo=False, crop_strategy='random_non_pocket'):
+                 crop_strategy='random_non_pocket'):
         super(Apo2HoloDataset, self).__init__()
         self.holo_ids = pickle.load(open(holo_list_path, 'rb'))  # 使用预保存的id列表，防止因为字典的无序性导致训练结果不一样
         self.base_path = base_path
@@ -51,7 +51,6 @@ class Apo2HoloDataset(Dataset):
         self.xyz_converter = XYZConverter_loader()
         self.n_crop = n_crop
         self.crop_max_dist = crop_max_dist
-        self.use_holo = use_holo
         self.crop_strategy = crop_strategy
         with gzip.open(base_path + '/ligands.json.gz', 'rt') as file:
             self.mols = json.load(file)  # 用于处理共价结合的蛋白质侧的残基
@@ -416,14 +415,9 @@ class Apo2HoloDataset(Dataset):
 
         """
         对于不提供预期holo构象的模型，使用apo结构作为模板，对于训练起到一个进行诱导契合过程作用，并且符合apo-holo的一对多的映射。
-        而对于提供预期holo构象的模型，则使用预期的holo构象作为模板。
         """
-        if self.use_holo:
-            xyzs_t = torch.concat([holo_pt['xyz'], torch.zeros_like(holo_sm_xyzs)], dim=0)[None]
-            xyzs_mask_t = torch.concat([holo_pt['xyz_mask'], torch.zeros_like(sm_xyzs_mask)], dim=0).bool()[None]
-        else:
-            xyzs_t = torch.concat([apo_pt['xyz'], torch.zeros_like(holo_sm_xyzs)], dim=0)[None]
-            xyzs_mask_t = torch.concat([apo_pt['xyz_mask'], torch.zeros_like(sm_xyzs_mask)], dim=0).bool()[None]
+        xyzs_t = torch.concat([apo_pt['xyz'], torch.zeros_like(holo_sm_xyzs)], dim=0)[None]
+        xyzs_mask_t = torch.concat([apo_pt['xyz_mask'], torch.zeros_like(sm_xyzs_mask)], dim=0).bool()[None]
         mask_t_2d = utils.get_prot_sm_mask(xyzs_mask_t, seq)  # 指出模板结构的有效区域
         mask_t_2d = mask_t_2d[:, None] * mask_t_2d[:, :, None]  # pairwise掩码
         mask_t_2d = mask_t_2d * same_chain.bool()[None]  # 忽略掉不同链间的对

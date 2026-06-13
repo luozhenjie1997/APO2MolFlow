@@ -41,7 +41,7 @@ ligand_covalent_bond：用于标记配体和蛋白质残基的共价连接信息
 
 class Apo2HoloDataset(Dataset):
     def __init__(self, base_path, apo_path, holo_path, holo_list_path, n_crop=384, crop_max_dist=20., atomize_protein=True,
-                 crop_strategy='random_non_pocket'):
+                 crop_strategy='random_non_pocket', use_holo=False):
         super(Apo2HoloDataset, self).__init__()
         self.holo_ids = pickle.load(open(holo_list_path, 'rb'))  # 使用预保存的id列表，防止因为字典的无序性导致训练结果不一样
         self.base_path = base_path
@@ -52,6 +52,7 @@ class Apo2HoloDataset(Dataset):
         self.n_crop = n_crop
         self.crop_max_dist = crop_max_dist
         self.crop_strategy = crop_strategy
+        self.use_holo = use_holo  # 是否将目标holo蛋白结构作为额外模板输入
         with gzip.open(base_path + '/ligands.json.gz', 'rt') as file:
             self.mols = json.load(file)  # 用于处理共价结合的蛋白质侧的残基
 
@@ -414,22 +415,57 @@ class Apo2HoloDataset(Dataset):
         same_chain = utils.same_chain_from_bond_feats(bond_feats)  # 获取是否属于同一个链的pairwise掩码
 
         """
-        对于不提供预期holo构象的模型，使用apo结构作为模板，对于训练起到一个进行诱导契合过程作用，并且符合apo-holo的一对多的映射。
+        构造模板：
+        1. 默认只使用apo模板，表示模型的结构起点；
+        2. 当use_holo=True时，额外加入目标holo蛋白模板，表示希望配体诱导到达的蛋白构象。
+        注意目标holo模板只暴露蛋白坐标，配体部分保持零坐标和无效mask，避免泄漏真实配体信息。
         """
-        xyzs_t = torch.concat([apo_pt['xyz'], torch.zeros_like(holo_sm_xyzs)], dim=0)[None]
-        xyzs_mask_t = torch.concat([apo_pt['xyz_mask'], torch.zeros_like(sm_xyzs_mask)], dim=0).bool()[None]
+        apo_template_xyz = torch.concat([
+            apo_pt['xyz'],
+            torch.zeros(apo_pt['xyz'].shape[0], chemical.NTOTAL - apo_pt['xyz'].shape[1], 3, device=apo_pt['xyz'].device)
+        ], dim=1)
+        apo_template_mask = torch.concat([
+            apo_pt['xyz_mask'],
+            torch.zeros(apo_pt['xyz_mask'].shape[0], chemical.NTOTAL - apo_pt['xyz_mask'].shape[1], device=apo_pt['xyz_mask'].device)
+        ], dim=1).bool()
+
+        zero_sm_xyzs = torch.zeros_like(holo_sm_xyzs)
+        zero_sm_mask = torch.zeros_like(sm_xyzs_mask)
+        template_xyzs = [torch.concat([apo_template_xyz, zero_sm_xyzs], dim=0)]
+        template_masks = [torch.concat([apo_template_mask, zero_sm_mask], dim=0)]
+        template_t1d = [t1d[0]]
+
+        if self.use_holo:
+            target_holo_template_xyz = torch.concat([
+                holo_pt['xyz'] - pocket_center,
+                torch.zeros(holo_pt['xyz'].shape[0], chemical.NTOTAL - holo_pt['xyz'].shape[1], 3, device=holo_pt['xyz'].device)
+            ], dim=1)
+            target_holo_template_mask = torch.concat([
+                holo_pt['xyz_mask'],
+                torch.zeros(holo_pt['xyz_mask'].shape[0], chemical.NTOTAL - holo_pt['xyz_mask'].shape[1], device=holo_pt['xyz_mask'].device)
+            ], dim=1).bool()
+            target_holo_t1d = t1d[0].clone()
+            target_holo_t1d[~is_protein, :] = 0.  # 目标holo模板不提供任何配体一维信息
+            template_xyzs.append(torch.concat([target_holo_template_xyz, zero_sm_xyzs], dim=0))
+            template_masks.append(torch.concat([target_holo_template_mask, zero_sm_mask], dim=0))
+            template_t1d.append(target_holo_t1d)
+
+        xyzs_t = torch.stack(template_xyzs, dim=0)
+        xyzs_mask_t = torch.stack(template_masks, dim=0).bool()
+        t1d = torch.stack(template_t1d, dim=0)
         mask_t_2d = utils.get_prot_sm_mask(xyzs_mask_t, seq)  # 指出模板结构的有效区域
         mask_t_2d = mask_t_2d[:, None] * mask_t_2d[:, :, None]  # pairwise掩码
         mask_t_2d = mask_t_2d * same_chain.bool()[None]  # 忽略掉不同链间的对
-        xyz_t_frame = utils.xyz_t_to_frame_xyz(xyzs_t, seq, sm_atom_frames)  # 将模板中的小分子配体的坐标映射到局部坐标系
+        xyz_t_frame = utils.xyz_t_to_frame_xyz(xyzs_t[None], seq, sm_atom_frames)[0]  # 将模板中的小分子配体的坐标映射到局部坐标系
         t2d = xyz_to_t2d(xyz_t_frame[None], mask_t_2d[None])[0]  # 二维模板
-        alpha_t, _, alpha_t_mask, _ = self.xyz_converter.get_torsions(xyzs_t.reshape(-1, L_sum, chemical.NTOTAL, 3), seq[None],
+        template_seq = seq[None].expand(xyzs_t.shape[0], -1)
+        alpha_t, _, alpha_t_mask, _ = self.xyz_converter.get_torsions(xyzs_t.reshape(-1, L_sum, chemical.NTOTAL, 3), template_seq,
                                                                       mask_in=xyzs_mask_t.reshape(-1, L_sum, chemical.NTOTAL))  # 获取模板扭转角和扭转角掩码
         torsion_angle_prev, _, alpha_prev_mask, _ = self.xyz_converter.get_torsions(xyzs_prev[None], seq[None], mask_in=xyzs_mask.reshape(-1, L_sum, chemical.NTOTAL))  # 获取apo结构扭转角和扭转角掩码
         torsion_angle_true, torsion_angle_alt_true, alpha_true_mask, planar = self.xyz_converter.get_torsions(xyzs_true[None], seq[None], mask_in=xyzs_mask.reshape(-1, L_sum, chemical.NTOTAL))  # 获取holo结构扭转角和扭转角掩码
         alpha_mask = alpha_prev_mask * alpha_true_mask
         # 将掩码作为模板扭转角特征
-        alpha_t = torch.concat([alpha_t, alpha_t_mask.reshape(1, L_sum, chemical.NTOTALDOFS, 1)], dim=-1)
+        alpha_t = torch.concat([alpha_t, alpha_t_mask.reshape(xyzs_t.shape[0], L_sum, chemical.NTOTALDOFS, 1)], dim=-1)
         mask_protein_BB = ~(xyzs_mask[:, :3].sum(dim=-1) < 3.0)  # 根据蛋白质主链情况来确定是否计算损失
         # 该掩码用于计算口袋区域的相关损失（包括配体）
         is_pocket_mask = torch.where(is_protein, False, True)

@@ -48,6 +48,7 @@ class RoseTTAFoldModule(nn.Module):
         d_t1d=0,
         d_t2d=0,
         d_time_emb=128,
+        d_mol_props=0,
         nextra_l0=0,
         p_drop=0.15,
         additional_dt1d=0,
@@ -122,6 +123,7 @@ class RoseTTAFoldModule(nn.Module):
             d_pair=d_pair,
             d_hidden=d_hidden,
             d_time_emb=d_time_emb,
+            d_mol_props=d_mol_props,
             nextra_l0=nextra_l0,
             n_head_msa=n_head_msa,
             n_head_pair=n_head_pair,
@@ -168,6 +170,7 @@ class RoseTTAFoldModule(nn.Module):
 
     def forward(self, t, msa_latent, msa_full, seq, xyz, alpha, idx, bond_feats, dist_matrix, sm_mask, is_atomize_protein,
                 chirals=None, sctors=None, seq1hot=None, bond_noisy=None, atom_frames=None, t1d=None, t2d=None, xyz_t=None, alpha_t=None, mask_t=None, same_chain=None,
+                mol_props=None,
                 msa_prev=None, pair_prev=None, state_prev=None, mask_recycle=None, is_motif=None,
                 return_raw=False, is_protein=None,
                 use_checkpoint=False,
@@ -209,11 +212,11 @@ class RoseTTAFoldModule(nn.Module):
         # 根据给定输入预测坐标更新量
         is_motif = is_motif if self.freeze_track_motif else torch.zeros_like(seq).bool()[0]
         msa, pair, xyz, alpha_s, state = self.simulator(
-            t, seq, msa_latent, msa_full, pair, xyz[:,:,:3], alpha, state, idx,
+            t, msa_latent, msa_full, pair, xyz[:,:,:3], alpha, state, idx,
             symmids, symmsub, symmRs, symmmeta,
             bond_feats, dist_matrix, same_chain, chirals, is_motif, sm_mask, is_protein, is_atomize_protein, atom_frames,
             use_checkpoint=use_checkpoint, use_atom_frames=self.use_atom_frames, 
-            p2p_crop=p2p_crop, topk_crop=topk_crop
+            p2p_crop=p2p_crop, topk_crop=topk_crop, mol_props=mol_props
         )
 
         if return_raw:

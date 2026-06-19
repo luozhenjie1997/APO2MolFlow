@@ -365,6 +365,100 @@ def calc_ligand_coord_loss(pred_xyz_stack, true_xyz, ligand_mask, gamma=1.0, eps
     return total_loss.mean()
 
 
+def calc_protein_ligand_contact_loss(pred_xyz, true_xyz, atom_mask, protein_mask, ligand_mask, contact_cutoff=6.0,
+                                     beta=0.5, eps=1e-8):
+    """
+    约束预测复合物复现真实holo结构中的蛋白-配体接触距离。
+    只选择真实结构中距离小于contact_cutoff的口袋蛋白原子-配体原子对，避免全局非接触对主导损失。
+    """
+    B = pred_xyz.shape[0]
+    contact_losses = []
+
+    for b in range(B):
+        protein_atom_mask = protein_mask[b, :, None].bool() & atom_mask[b].bool()
+        ligand_atom_mask = ligand_mask[b, :, None].bool() & atom_mask[b].bool()
+
+        if protein_atom_mask.sum().item() == 0 or ligand_atom_mask.sum().item() == 0:
+            continue
+
+        true_protein_xyz = true_xyz[b][protein_atom_mask].float()
+        true_ligand_xyz = true_xyz[b][ligand_atom_mask].float()
+        pred_protein_xyz = pred_xyz[b][protein_atom_mask].float()
+        pred_ligand_xyz = pred_xyz[b][ligand_atom_mask].float()
+
+        true_dist = torch.cdist(true_protein_xyz, true_ligand_xyz)
+        contact_mask = true_dist < contact_cutoff
+        if contact_mask.sum().item() == 0:
+            continue
+
+        pred_dist = torch.cdist(pred_protein_xyz, pred_ligand_xyz)
+        contact_loss = F.smooth_l1_loss(pred_dist[contact_mask], true_dist[contact_mask], beta=beta, reduction='mean')
+        contact_losses.append(contact_loss)
+
+    if len(contact_losses) == 0:
+        return pred_xyz.new_tensor(0.0)
+
+    return torch.stack(contact_losses).mean()
+
+
+def calc_pocket_displacement_loss(pred_ca_stack, apo_ca, true_ca, pocket_mask, gamma=1.0, beta=0.5, eps=1e-8):
+    """
+    约束口袋区域从apo到holo的构象位移方向和幅度。
+    相比直接拟合holo坐标，该损失显式监督模型学习 apo -> holo 的口袋构象变化。
+    """
+    if pocket_mask.sum().item() == 0:
+        return pred_ca_stack.new_tensor(0.0)
+
+    target_delta = true_ca - apo_ca
+    pred_delta = pred_ca_stack - apo_ca[None]
+    target_delta = target_delta[None].expand_as(pred_delta)
+
+    displacement_err = F.smooth_l1_loss(pred_delta, target_delta, beta=beta, reduction='none')
+    displacement_err = displacement_err.mean(dim=-1)  # (I, B, L)
+    pocket_mask = pocket_mask.bool()
+    displacement_err = (displacement_err * pocket_mask[None]).sum(dim=(1, 2)) / (pocket_mask.sum() + eps)
+
+    I = pred_ca_stack.shape[0]
+    w_loss = torch.pow(torch.full((I,), gamma, device=pred_ca_stack.device), torch.arange(I, device=pred_ca_stack.device))
+    w_loss = torch.flip(w_loss, (0,))
+    w_loss = w_loss / w_loss.sum()
+
+    return (w_loss * displacement_err).sum()
+
+
+def calc_ca_distance_map_loss(pred_ca_stack, true_ca, ca_mask, same_chain=None, max_dist=30.0, gamma=1.0, beta=0.5, eps=1e-8):
+    """
+    约束整体holo构象的CA-CA距离图。
+    只在有效蛋白残基、同链、非对角线且真实距离小于max_dist的残基对上计算，降低远距离非接触对的噪声。
+    """
+    I, B, L = pred_ca_stack.shape[:3]
+    ca_mask = ca_mask.bool()
+    pair_mask = ca_mask[:, :, None] & ca_mask[:, None, :]
+    pair_mask &= ~torch.eye(L, dtype=torch.bool, device=pred_ca_stack.device)[None]
+
+    if same_chain is not None:
+        pair_mask &= same_chain.bool()
+
+    true_dist = torch.cdist(true_ca.float(), true_ca.float())
+    pair_mask &= true_dist < max_dist
+    if pair_mask.sum().item() == 0:
+        return pred_ca_stack.new_tensor(0.0)
+
+    pred_dist = torch.cdist(
+        pred_ca_stack.reshape(I * B, L, 3).float(),
+        pred_ca_stack.reshape(I * B, L, 3).float()
+    ).reshape(I, B, L, L)
+
+    distance_err = F.smooth_l1_loss(pred_dist, true_dist[None].expand_as(pred_dist), beta=beta, reduction='none')
+    distance_err = (distance_err * pair_mask[None]).sum(dim=(1, 2, 3)) / (pair_mask.sum() + eps)
+
+    w_loss = torch.pow(torch.full((I,), gamma, device=pred_ca_stack.device), torch.arange(I, device=pred_ca_stack.device))
+    w_loss = torch.flip(w_loss, (0,))
+    w_loss = w_loss / w_loss.sum()
+
+    return (w_loss * distance_err).sum()
+
+
 def calc_c6d_loss(logit_s, label_s, mask_2d, eps=1e-8):
     loss_s = list()
     for i in range(len(logit_s)):

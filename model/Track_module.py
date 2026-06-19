@@ -184,16 +184,6 @@ def find_symmsub(Ltot, Lasu, k):
     return symmsub.long()
 
 
-def copy_block_activations(pair, symmsub, main_block):
-    """
-    copies pair activations around in blocks according to 
-    matrix S
-    """
-    raise NotImplementedError
-
-    return False 
-
-
 def max_block_activations(pair, symmsub):
     """
     copies pair activations around in blocks according to 
@@ -1014,9 +1004,20 @@ class IterBlock(nn.Module):
 
         return msa, pair, xyz, state, alpha, symmsub
 
+
+class ShiftedSoftplus(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.shift = torch.log(torch.tensor(2.0)).item()
+
+    def forward(self, x):
+        return F.softplus(x) - self.shift
+
+
 class IterativeSimulator(nn.Module):
     def __init__(self, n_extra_block=4, n_main_block=12, n_ref_block=4, n_finetune_block=0,
          d_msa=256, d_msa_full=64, d_pair=128, d_hidden=32, d_time_emb=128, nextra_l0=0,
+         d_mol_props=0,
          n_head_msa=8, n_head_pair=4,
          SE3_param={}, SE3_ref_param={}, p_drop=0.15,
          atom_type_index=None, aamask=None, 
@@ -1052,9 +1053,18 @@ class IterativeSimulator(nn.Module):
         self.enable_same_chain = enable_same_chain
         self.fit = fit
         self.tscale = tscale
-        self.d_time_emb=d_time_emb
+        self.d_time_emb = d_time_emb
+        self.d_mol_props = d_mol_props
 
         self.alpha_embedder = nn.Linear(30, SE3_param['l0_out_features'])  # 扭转角编码
+        if d_mol_props > 0:
+            self.mol_prop_embedder = nn.Sequential(
+                nn.Linear(d_mol_props, d_time_emb),
+                ShiftedSoftplus(),
+                nn.Linear(d_time_emb, d_time_emb),
+            )
+        else:
+            self.mol_prop_embedder = None
 
         # Update with extra sequences
         if n_extra_block > 0:
@@ -1127,13 +1137,18 @@ class IterativeSimulator(nn.Module):
     def reset_parameter(self):
         self.alpha_embedder = util_module.init_lecun_normal(self.alpha_embedder)
         nn.init.zeros_(self.alpha_embedder.bias)
+        if self.mol_prop_embedder is not None:
+            self.mol_prop_embedder[0] = util_module.init_lecun_normal(self.mol_prop_embedder[0])
+            nn.init.zeros_(self.mol_prop_embedder[0].bias)
+            nn.init.zeros_(self.mol_prop_embedder[2].weight)
+            nn.init.zeros_(self.mol_prop_embedder[2].bias)
 
     def forward(
-        self, t, seq, msa, msa_full, pair, xyz, alpha, state, idx,
+        self, t, msa, msa_full, pair, xyz, alpha, state, idx,
         symmids, symmsub, symmRs, symmmeta, 
         bond_feats, dist_matrix, same_chain, chirals, is_motif, sm_mask, is_protein, is_atomize_protein,
         atom_frames=None, use_checkpoint=False, use_atom_frames=False,
-        p2p_crop=-1, topk_crop=0
+        p2p_crop=-1, topk_crop=0, mol_props=None
     ):
         # input:
         #   msa: initial MSA embeddings (N, L, d_msa)
@@ -1150,8 +1165,16 @@ class IterativeSimulator(nn.Module):
         xyz_s = list()
         alpha_s = list()
 
-        """与RFDiffusion不同，本项目利用l0特征（该特征对旋转不变）传入时间步嵌入"""
+        """与RFDiffusion不同，本项目利用l0特征（该特征对旋转不变）传入时间步嵌入和分子性质嵌入"""
         t_emb = get_time_embedding(t, self.d_time_emb)[:, None, :].repeat(1, L, 1)
+        if self.mol_prop_embedder is not None:
+            if mol_props is None:
+                mol_props = torch.zeros((B, self.d_mol_props), device=t_emb.device, dtype=t_emb.dtype)
+            mol_props = torch.nan_to_num(mol_props.to(device=t_emb.device, dtype=t_emb.dtype), nan=0.0, posinf=0.0, neginf=0.0)
+            prop_emb = self.mol_prop_embedder(mol_props.float()).to(t_emb.dtype)
+            # 分子性质只作为配体生成条件注入；蛋白部分保持纯时间步嵌入。
+            ligand_prop_mask = sm_mask & ~is_atomize_protein
+            t_emb = t_emb + prop_emb[:, None, :] * ligand_prop_mask[..., None].to(t_emb.dtype)
         extra_l0 = None
 
         extra_l1 = None

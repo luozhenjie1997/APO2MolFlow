@@ -15,7 +15,7 @@ from openfold.all_atom import to_atom37
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler  # 分布式采样器
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from contextlib import nullcontext
@@ -68,13 +68,18 @@ def train(local_rank):
     interpolant = Interpolant(device=local_rank).to(local_rank)  # 用于对数据进行插值
     # 计算所有原子坐标的工具
     atom_coords_converter = util_module.XYZConverter().to(local_rank)
-    scaler = GradScaler()  # 动态 loss scaling，防止 fp16 下梯度下溢
 
     if os.path.exists('./save_model/checkpoint.ckpt'):
         checkpoint = torch.load('./save_model/checkpoint.ckpt', map_location='cuda:%s' % local_rank)
-        model.load_state_dict(checkpoint['last_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        load_info = model.load_state_dict(checkpoint['last_state_dict'], strict=False)
+        if local_rank == 0 and (len(load_info.missing_keys) > 0 or len(load_info.unexpected_keys) > 0):
+            print("Model checkpoint loaded with missing keys: %s, unexpected keys: %s" %
+                  (load_info.missing_keys, load_info.unexpected_keys))
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        except ValueError as exc:
+            if local_rank == 0:
+                print("Skip optimizer state loading because model parameters changed: %s" % exc)
         epoch = checkpoint['epoch']
         log_name = checkpoint['log_name']
         log_steps = checkpoint['log_steps']
@@ -124,7 +129,6 @@ def train(local_rank):
         batch_total_loss = torch.tensor(0., device=local_rank)
         batch_sm_token_loss = torch.tensor(0., device=local_rank)
         batch_bond_loss = torch.tensor(0., device=local_rank)
-        batch_allatom_fape_loss = torch.tensor(0., device=local_rank)
         batch_protein_sm_fape_loss = torch.tensor(0., device=local_rank)
         batch_sm_protein_fape_loss = torch.tensor(0., device=local_rank)
         batch_protein_trans_loss = torch.tensor(0., device=local_rank)
@@ -133,13 +137,13 @@ def train(local_rank):
         batch_protein_blen_loss = torch.tensor(0., device=local_rank)
         batch_protein_bang_loss = torch.tensor(0., device=local_rank)
         batch_ligand_coords_loss = torch.tensor(0., device=local_rank)
+        batch_protein_ligand_contact_loss = torch.tensor(0., device=local_rank)
         batch_ligand_bond_loss = torch.tensor(0., device=local_rank)
         batch_ligand_rigid_loss = torch.tensor(0., device=local_rank)
         batch_ligand_chiral_loss = torch.tensor(0., device=local_rank)
         n_ligand_chiral = torch.tensor(0., device=local_rank)
         batch_c6d_loss = torch.tensor(0., device=local_rank)
         batch_lddt = torch.tensor(0., device=local_rank)
-        batch_pocket_lddt = torch.tensor(0., device=local_rank)
         batch_plddt = torch.tensor(0., device=local_rank)
         batch_plddt_loss = torch.tensor(0., device=local_rank)
 
@@ -163,6 +167,7 @@ def train(local_rank):
             #     continue
 
             B, L = pdb_data['idx'].shape[:2]
+            mol_props = pdb_data.get('condition', {}).get('mol_props', None)
 
             if local_rank == 0:
                 pbar.set_description_str("epoch:%s, L=%s" % (e + 1,L))
@@ -186,7 +191,7 @@ def train(local_rank):
             pdb_data['template']['t1d'][:, 0, :, :70] = xt['seq_xt']
 
             use_checkpoint = True
-            # if L >= 130:
+            # if L > 190:
             #     use_checkpoint = True
             # else:
             #     use_checkpoint = False
@@ -213,6 +218,7 @@ def train(local_rank):
                             mask_t=pdb_data['template']['mask_t_2d'], sm_mask=sm_mask, is_protein=pdb_data['is_protein'],
                             is_atomize_protein=pdb_data['is_atomize_protein'], atom_frames=pdb_data['atom_frames'],
                             same_chain=pdb_data['same_chain'], msa_prev=msa_prev, pair_prev=pair_prev, state_prev=state_prev,
+                            mol_props=mol_props,
                             return_raw=True, topk_crop=config['model']['topk_crop'], p2p_crop=config['train']['p2p_crop'])
 
             # 在单机多卡环境中，只在每个进程的最后一个mini-batch中进行梯度同步
@@ -228,7 +234,7 @@ def train(local_rank):
                         mask_t=pdb_data['template']['mask_t_2d'], sm_mask=sm_mask, is_protein=pdb_data['is_protein'],
                         is_atomize_protein=pdb_data['is_atomize_protein'], atom_frames=pdb_data['atom_frames'],
                         same_chain=pdb_data['same_chain'], use_checkpoint=use_checkpoint, msa_prev=msa_prev, pair_prev=pair_prev,
-                        state_prev=state_prev, topk_crop=config['model']['topk_crop'], p2p_crop=config['train']['p2p_crop'])
+                        state_prev=state_prev, mol_props=mol_props, topk_crop=config['model']['topk_crop'], p2p_crop=config['train']['p2p_crop'])
                 # xyz = xyz / config['model']['position_scale']  # 解除坐标缩放
                 I, B, L, _, _ = xyz.shape
 
@@ -263,17 +269,6 @@ def train(local_rank):
                 # 配体部分不用进行对称性处理
                 nat_symm[~mask_protein_BB[0], :, :3] = pdb_data['xyzs']['xyzs_true'][:, ~mask_protein_BB[0], :, :3]
 
-                """fape损失"""
-                pocket_res_mask_with_ligand = pdb_data['is_pocket_mask'] * torch.where(pdb_data['sm_mask'], True, mask_protein_BB)
-                pocket_atom_mask = pdb_data['xyzs']['xyzs_mask'].clone()
-                pocket_frame_mask = pdb_data['frame_mask'].clone()
-                # 屏蔽掉非口袋区域和非配体区域
-                pocket_atom_mask[0, ~pocket_res_mask_with_ligand[0], :] = False
-                pocket_frame_mask[0, ~pocket_res_mask_with_ligand[0], :] = False
-                # 口袋区域（包括蛋白质和配体）全原子fape损失
-                allatom_fape_loss = loss.compute_general_FAPE(pred_allatom, pdb_data['xyzs']['xyzs_true'], pocket_atom_mask,
-                                                              pdb_data['frames'], pocket_frame_mask, gamma=config.train.loss_weight.gamma)
-
                 """蛋白质主链框架损失。使用RFDiffusion提出的框架损失"""
                 # 获取预测坐标的框架
                 N_pred, Ca_pred, C_pred = xyz[:, :, :, 0], xyz[:, :, :, 1], xyz[:, :, :, 2]
@@ -298,6 +293,13 @@ def train(local_rank):
                 ligand_coords_loss = loss.calc_ligand_coord_loss(pred_ligand, true_ligand, ligand_mask[ligand_mask].reshape(B, -1),
                                                                  gamma=config.train.loss_weight.gamma)
 
+                """蛋白-配体接触距离损失"""
+                protein_contact_mask = pdb_data['is_pocket_mask'] & pdb_data['is_protein'] & mask_protein_BB
+                protein_ligand_contact_loss = loss.calc_protein_ligand_contact_loss(
+                    pred_allatom, pdb_data['xyzs']['xyzs_true'], pdb_data['xyzs']['xyzs_mask'],
+                    protein_contact_mask, ligand_mask
+                )
+
                 mask = (pdb_data['xyzs']['xyzs_mask'][:, :, 1] == 1.0)
                 pair_mask = mask[:, None, :] * mask[..., None]
 
@@ -305,10 +307,9 @@ def train(local_rank):
                 c6d_loss = loss.calc_c6d_loss(logits_c6d, pdb_data['xyzs']['c6d'].long(), pair_mask)
 
                 """lddt预测损失"""
-                lddt, pocket_lddt, plddt, plddt_loss = loss.calc_allatom_lddt_loss(pred_allatom[:, :, :14].detach(), nat_symm[:, :14],
-                                                                                   logits_plddt, pdb_data['idx'], pdb_data['xyzs']['xyzs_mask'][:, :, :14],
-                                                                                   pair_mask, pdb_data['same_chain'], N_stripe=10,
-                                                                                   pocket_mask=pdb_data['is_pocket_mask'])
+                lddt, plddt, plddt_loss = loss.calc_allatom_lddt_loss(pred_allatom[:, :, :14].detach(), nat_symm[:, :14],
+                                                                      logits_plddt, pdb_data['idx'], pdb_data['xyzs']['xyzs_mask'][:, :, :14],
+                                                                      pair_mask, pdb_data['same_chain'], N_stripe=10)
 
                 """pae预测损失"""
                 # pae_loss = loss.calc_pae_loss(logits_pae, xyz[-1], pdb_data['xyzs']['xyzs_true'], mask, sm_mask, pdb_data['atom_frames'])
@@ -334,7 +335,7 @@ def train(local_rank):
                     geometry_loss = torch.tensor(0.0, device=xyz.device)
 
                 # TODO: 以下辅助损失应用逻辑只限定在批次为1的情况，后续需要修正
-                aux_loss = (loss_weight.allatom_fape * allatom_fape_loss + geometry_loss)
+                aux_loss = (loss_weight.protein_ligand_contact * protein_ligand_contact_loss + geometry_loss)
                 if xt['t'].mean() < config['train']['use_aux_loss']:  # 时间步大于指定阈值时才启用辅助损失
                     aux_loss *= 0.
 
@@ -342,9 +343,9 @@ def train(local_rank):
                               loss_weight.frame_distance * protein_frame_distance_loss / norm_scale + loss_weight.ligand_coords * ligand_coords_loss / norm_scale +
                               loss_weight.c6d * c6d_loss + loss_weight.plddt * plddt_loss + aux_loss) / config.train.pseudo_batch_size
                 if is_predict:
-                    scaler.scale(total_loss * config['train']['predict_weight']).backward()
+                    (total_loss * config['train']['predict_weight']).backward()
                 else:
-                    scaler.scale(total_loss).backward()
+                    total_loss.backward()
             if torch.isnan(total_loss):
                 print(holo_pdb_id, apo_pdb_id, 'loss is nan')
                 exit(-1)
@@ -352,14 +353,13 @@ def train(local_rank):
             batch_total_loss += total_loss.detach() / config.train.gpu_nums
             batch_sm_token_loss += sm_token_loss.detach()
             batch_bond_loss += bond_loss.detach()
-            batch_allatom_fape_loss += allatom_fape_loss.detach()
             batch_protein_trans_loss += trans_err.detach()
             batch_protein_rots_loss += rots_err.detach()
             batch_tors_loss += tors_loss.detach()
             batch_ligand_coords_loss += ligand_coords_loss.detach()
+            batch_protein_ligand_contact_loss += protein_ligand_contact_loss.detach()
             batch_c6d_loss += c6d_loss.detach()
             batch_lddt += lddt.detach()
-            batch_pocket_lddt += pocket_lddt.detach()
             batch_plddt += plddt.detach()
             batch_plddt_loss += plddt_loss.detach()
             if USE_GEOMETRY:
@@ -371,55 +371,55 @@ def train(local_rank):
             used_count += 1
 
             if used_count % accumulation_steps == 0:
-                scaler.unscale_(optimizer)  # 解除缩放
                 # 梯度裁剪，并记录梯度的范数情况。max_norm=float('inf') 表示不进行裁剪，只计算范数。
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.train.grad_clip)
                 if torch.isnan(grad_norm):
                     print(holo_pdb_id, apo_pdb_id, "grad is nan")
                     print([
-                        batch_total_loss, batch_sm_token_loss, batch_bond_loss, batch_allatom_fape_loss, batch_protein_sm_fape_loss,
-                        batch_sm_protein_fape_loss, batch_protein_trans_loss, batch_protein_rots_loss, batch_tors_loss,
-                        batch_protein_blen_loss, batch_protein_bang_loss, batch_ligand_coords_loss, batch_ligand_bond_loss,
-                        batch_ligand_rigid_loss, batch_ligand_chiral_loss, n_ligand_chiral, batch_c6d_loss, batch_lddt,
-                        batch_pocket_lddt, batch_plddt, batch_plddt_loss
+                        batch_total_loss, batch_sm_token_loss, batch_bond_loss, batch_protein_sm_fape_loss,
+                        batch_sm_protein_fape_loss, batch_protein_trans_loss, batch_protein_rots_loss,
+                        batch_tors_loss, batch_protein_blen_loss, batch_protein_bang_loss, batch_ligand_coords_loss,
+                        batch_protein_ligand_contact_loss, batch_ligand_bond_loss, batch_ligand_rigid_loss,
+                        batch_ligand_chiral_loss, n_ligand_chiral, batch_c6d_loss, batch_lddt,
+                        batch_plddt, batch_plddt_loss
                     ])
                     exit(-1)
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
 
                 # 定义需要同步的损失变量列表
                 loss_vars = [
-                        batch_total_loss, batch_sm_token_loss, batch_bond_loss, batch_allatom_fape_loss, batch_protein_sm_fape_loss,
-                        batch_sm_protein_fape_loss, batch_protein_trans_loss, batch_protein_rots_loss, batch_tors_loss,
-                        batch_protein_blen_loss, batch_protein_bang_loss, batch_ligand_coords_loss, batch_ligand_bond_loss,
-                        batch_ligand_rigid_loss, batch_ligand_chiral_loss, n_ligand_chiral, batch_c6d_loss, batch_lddt,
-                        batch_pocket_lddt, batch_plddt, batch_plddt_loss
+                        batch_total_loss, batch_sm_token_loss, batch_bond_loss, batch_protein_sm_fape_loss,
+                        batch_sm_protein_fape_loss, batch_protein_trans_loss, batch_protein_rots_loss,
+                        batch_tors_loss, batch_protein_blen_loss, batch_protein_bang_loss, batch_ligand_coords_loss,
+                        batch_protein_ligand_contact_loss, batch_ligand_bond_loss, batch_ligand_rigid_loss,
+                        batch_ligand_chiral_loss, n_ligand_chiral, batch_c6d_loss, batch_lddt,
+                        batch_plddt, batch_plddt_loss
                     ]
                 # 合并所有标量后只进行一次跨进程同步，减少通信调用次数
                 reduced_loss_vars = torch.stack(loss_vars)
                 dist.all_reduce(reduced_loss_vars, op=dist.ReduceOp.SUM)
-                batch_total_loss, batch_sm_token_loss, batch_bond_loss, batch_allatom_fape_loss, batch_protein_sm_fape_loss, \
-                    batch_sm_protein_fape_loss, batch_protein_trans_loss, batch_protein_rots_loss, batch_tors_loss, \
-                    batch_protein_blen_loss, batch_protein_bang_loss, batch_ligand_coords_loss, batch_ligand_bond_loss, \
-                    batch_ligand_rigid_loss, batch_ligand_chiral_loss, n_ligand_chiral, batch_c6d_loss, batch_lddt, \
-                    batch_pocket_lddt, batch_plddt, batch_plddt_loss = reduced_loss_vars.unbind()
+                batch_total_loss, batch_sm_token_loss, batch_bond_loss, batch_protein_sm_fape_loss, \
+                    batch_sm_protein_fape_loss, batch_protein_trans_loss, batch_protein_rots_loss, \
+                    batch_tors_loss, batch_protein_blen_loss, batch_protein_bang_loss, batch_ligand_coords_loss, \
+                    batch_protein_ligand_contact_loss, batch_ligand_bond_loss, batch_ligand_rigid_loss, \
+                    batch_ligand_chiral_loss, n_ligand_chiral, batch_c6d_loss, batch_lddt, \
+                    batch_plddt, batch_plddt_loss = reduced_loss_vars.unbind()
 
                 # 主进程记录日志
                 if local_rank == 0:
                     writer.add_scalar("train/grad_norm", grad_norm.item(), log_steps)
                     writer.add_scalar("train/total_loss", batch_total_loss.item(), log_steps)
                     writer.add_scalar("train/c6d_loss", batch_c6d_loss.item() / config.train.batch_size, log_steps)
-                    writer.add_scalar("train/pocket_allatom_fape_loss", batch_allatom_fape_loss.item() / config.train.batch_size, log_steps)
                     writer.add_scalar("train_protein/trans_loss", batch_protein_trans_loss.item() / config.train.batch_size, log_steps)
                     writer.add_scalar("train_protein/rots_loss", batch_protein_rots_loss.item() / config.train.batch_size, log_steps)
                     writer.add_scalar("train_protein/tors_loss", batch_tors_loss.item() / config.train.batch_size, log_steps)
                     writer.add_scalar("train_ligand/ligand_coords_loss", batch_ligand_coords_loss.item() / config.train.batch_size, log_steps)
+                    writer.add_scalar("train_ligand/protein_ligand_contact_loss", batch_protein_ligand_contact_loss.item() / config.train.batch_size, log_steps)
                     writer.add_scalar("train_ligand/ligand_seq_loss", batch_sm_token_loss.item() / config.train.batch_size, log_steps)
                     writer.add_scalar("train_ligand/ligand_bond_token_loss", batch_bond_loss.item() / config.train.batch_size, log_steps)
                     writer.add_scalar("train_lddt/lddt", batch_lddt.item() / config.train.batch_size, log_steps)
-                    writer.add_scalar("train_lddt/pocket_lddt", batch_pocket_lddt.item() / config.train.batch_size, log_steps)
                     writer.add_scalar("train_lddt/plddt", batch_plddt.item() / config.train.batch_size, log_steps)
                     writer.add_scalar("train_lddt/plddt_loss", batch_plddt_loss.item() / config.train.batch_size, log_steps)
                     if USE_GEOMETRY:
@@ -435,20 +435,19 @@ def train(local_rank):
                 batch_bond_loss = torch.tensor(0., device=local_rank)
                 batch_protein_sm_fape_loss = torch.tensor(0., device=local_rank)
                 batch_sm_protein_fape_loss = torch.tensor(0., device=local_rank)
-                batch_allatom_fape_loss = torch.tensor(0., device=local_rank)
                 batch_protein_trans_loss = torch.tensor(0., device=local_rank)
                 batch_protein_rots_loss = torch.tensor(0., device=local_rank)
                 batch_tors_loss = torch.tensor(0., device=local_rank)
                 batch_protein_blen_loss = torch.tensor(0., device=local_rank)
                 batch_protein_bang_loss = torch.tensor(0., device=local_rank)
                 batch_ligand_coords_loss = torch.tensor(0., device=local_rank)
+                batch_protein_ligand_contact_loss = torch.tensor(0., device=local_rank)
                 batch_ligand_bond_loss = torch.tensor(0., device=local_rank)
                 batch_ligand_rigid_loss = torch.tensor(0., device=local_rank)
                 batch_ligand_chiral_loss = torch.tensor(0., device=local_rank)
                 n_ligand_chiral = torch.tensor(0., device=local_rank)
                 batch_c6d_loss = torch.tensor(0., device=local_rank)
                 batch_lddt = torch.tensor(0., device=local_rank)
-                batch_pocket_lddt = torch.tensor(0., device=local_rank)
                 batch_plddt = torch.tensor(0., device=local_rank)
                 batch_plddt_loss = torch.tensor(0., device=local_rank)
 
@@ -476,7 +475,6 @@ def train(local_rank):
             save_dict = {
                 "last_state_dict": model.module.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
-                'scaler_state_dict': scaler.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 "epoch": e,
                 'log_name': log_name,

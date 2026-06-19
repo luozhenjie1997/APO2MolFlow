@@ -1,3 +1,5 @@
+import os
+import sys
 import pickle
 import torch
 import random
@@ -8,15 +10,25 @@ import model.utils.utils as utils
 from torch.utils.data import Dataset
 from Bio.Align import PairwiseAligner
 from collections import defaultdict
+from rdkit import Chem, RDLogger
+from rdkit.Chem import Crippen, Descriptors, Lipinski, QED, rdMolDescriptors
+from rdkit.Chem import RDConfig
 from model.utils.chemical import NAATOKENS, num2aa, aa2long_noblank, aa2elt, aa2num, BBHeavyAtom
 from model.utils.kinematics import xyz_to_t2d, get_chirals, xyz_to_c6d, c6d_to_bins, get_chiral_tags_from_mol
 from model.utils.geometry import iterative_rigid_core_align, align_residue_level
 from model.utils.util_module import XYZConverter_loader
 from model.utils.geometry import construct_3d_basis, align, rot_matrix_to_quat
 
-from rdkit import RDLogger
+# 动态添加 SA_Score 等 Contrib 模块所在的目录
+sys.path.append('/root/miniconda3/envs/APO2MolFlow/share/RDKit/Contrib/SA_Score')
+import sascorer
+
 lg = RDLogger.logger()
 lg.setLevel(RDLogger.CRITICAL)  # 只显示关键错误
+
+MOL_PROP_NAMES = ('QED', 'SA', 'LogP', 'TPSA', 'HBA', 'HBD', 'Fsp3', 'ROTB', 'MW', 'formal_charge', 'ring_count')
+_SA_SCORER = None
+_SA_SCORER_LOADED = False
 
 """
 暂时不使用配体模板，后续看一下是否进行基于官能团的设计
@@ -39,6 +51,29 @@ ligand_covalent_bond：用于标记配体和蛋白质残基的共价连接信息
                       第二部分保存了和配体形成共价连接的原子索引（从0开始）
 """
 
+
+def _remove_leaving_atoms(mol, leaving_mask):
+    """
+    共价样本中训练目标会去掉离去基团，因此分子性质也尽量基于实际保留的配体部分计算。
+    """
+    if leaving_mask is None:
+        return mol
+    if isinstance(leaving_mask, torch.Tensor):
+        leaving_mask = leaving_mask.detach().cpu().bool().tolist()
+    if len(leaving_mask) != mol.GetNumAtoms() or not any(leaving_mask):
+        return mol
+
+    editable_mol = Chem.RWMol(mol)
+    for atom_idx in reversed([i for i, is_leaving in enumerate(leaving_mask) if is_leaving == 0]):
+        editable_mol.RemoveAtom(atom_idx)
+    new_mol = editable_mol.GetMol()
+    try:
+        Chem.SanitizeMol(new_mol)
+        return new_mol
+    except Exception:
+        return mol
+
+
 class Apo2HoloDataset(Dataset):
     def __init__(self, base_path, apo_path, holo_path, holo_list_path, n_crop=384, crop_max_dist=20., atomize_protein=True,
                  crop_strategy='random_non_pocket', use_holo=False):
@@ -53,6 +88,7 @@ class Apo2HoloDataset(Dataset):
         self.crop_max_dist = crop_max_dist
         self.crop_strategy = crop_strategy
         self.use_holo = use_holo  # 是否将目标holo蛋白结构作为额外模板输入
+        self.mol_prop_names = MOL_PROP_NAMES
         with gzip.open(base_path + '/ligands.json.gz', 'rt') as file:
             self.mols = json.load(file)  # 用于处理共价结合的蛋白质侧的残基
 
@@ -97,6 +133,30 @@ class Apo2HoloDataset(Dataset):
 
         return feats_dict
 
+    def _calc_ligand_mol_props(self, holo_id, leaving_mask=None):
+        """
+        计算配体分子性质，暂不进行归一化。
+        顺序由MOL_PROP_NAMES定义：QED, SA, LogP, TPSA, HBA, HBD, Fsp3, ROTB, MW, formal_charge, ring_count。
+        """
+        mol = Chem.MolFromMolFile(self.holo_path + '/%s/%s/%s_ligand.sdf' % (holo_id[1:3], holo_id, holo_id))
+        if mol is None:
+            return torch.full((len(MOL_PROP_NAMES),), float('nan'), dtype=torch.float)
+
+        mol = _remove_leaving_atoms(Chem.RemoveHs(mol), leaving_mask)
+        sa_score = round((10 - sascorer.calculateScore(mol)) / 9,2)  # 获取SA并归一化至[0, 1]
+
+        props = [
+            float(QED.qed(mol)),
+            sa_score,
+            float(Crippen.MolLogP(mol)),
+            float(rdMolDescriptors.CalcTPSA(mol)),
+            float(Lipinski.NumHAcceptors(mol)),
+            float(Lipinski.NumHDonors(mol)),
+            float(rdMolDescriptors.CalcFractionCSP3(mol)),
+            float(Lipinski.NumRotatableBonds(mol)),
+        ]
+        return torch.tensor(props, dtype=torch.float)
+
     def __getitem__(self, idx):
         apo_holo_id = self.holo_ids[idx]
         # apo_holo_id = '2aay__A|1EPS__A'
@@ -118,6 +178,8 @@ class Apo2HoloDataset(Dataset):
                 apo_pt[key.replace('apo_', '')] = item
             elif 'ligand_' in key:
                 holo_ligand_pt[key.replace('ligand_', '')] = item
+
+        mol_props = self._calc_ligand_mol_props(holo_id, leaving_mask=holo_pt['is_leaving_ligand'])
 
         seq_is_eq = True
         for apo_seq, holo_seq in zip(apo_pt['seq'], holo_pt['seq']):
@@ -483,6 +545,7 @@ class Apo2HoloDataset(Dataset):
                      'atom_frames': sm_atom_frames, 'idx': input_idx, 'same_chain': same_chain, 'is_protein': is_protein,
                      'is_atomize_protein': is_atomize_protein, 'cova_mask': cova_mask, 'is_pocket_mask': is_pocket_mask,
                      'mask_protein_BB': mask_protein_BB, 'sm_mask': ~is_protein, 'is_predict': is_predict,
+                     'condition': {'mol_props': mol_props},
                      'apo_pdb_id': apo_id, 'holo_pdb_id': holo_id}
 
         if seq.shape[0] > self.n_crop:

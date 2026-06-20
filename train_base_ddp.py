@@ -46,6 +46,155 @@ def setup_distributed():
     torch.cuda.set_device(LOCAL_RANK)  # 绑定当前进程到对应GPU
 
 
+@torch.no_grad()
+def validate(model, dataloader, interpolant, atom_coords_converter, config, local_rank, writer, log_steps):
+    """
+    在验证集上评估当前训练目标。验证时固定t=0.5，减少随机时间步带来的曲线抖动。
+    """
+    model.eval()
+    loss_weight = config.train.loss_weight
+    metric_names = [
+        "total_loss", "sm_token_loss", "bond_loss", "protein_trans_loss", "protein_rots_loss",
+        "tors_loss", "ligand_coords_loss", "protein_ligand_contact_loss", "c6d_loss",
+        "lddt", "plddt", "plddt_loss"
+    ]
+    metric_sums = torch.zeros(len(metric_names), device=local_rank)
+    sample_count = torch.tensor(0.0, device=local_rank)
+    n_cycle = config.model.n_cycle
+
+    for pdb_data in dataloader:
+        pdb_data = utils.recursive_to(pdb_data, local_rank)
+        B, L = pdb_data['idx'].shape[:2]
+        mol_props = pdb_data.get('condition', {}).get('mol_props', None)
+        mask_protein_BB = pdb_data['mask_protein_BB']
+
+        xt = interpolant(pdb_data, t=0.5)
+        xyzs_prev = to_atom37(xt['trans_t'], xt['rots_t'])[:, :, :NTOTAL]
+        sm_xyzs_t = torch.concat([
+            torch.zeros((B, L, 1, 3), device=xyzs_prev.device),
+            torch.concat([torch.zeros((B, L - xt['ligand_xyzs_t'].shape[1], 1, 3), device=xyzs_prev.device),
+                          xt['ligand_xyzs_t'].view(-1).reshape(B, xt['ligand_xyzs_t'].shape[1], 1, 3)], dim=1),
+            torch.zeros((B, L, pdb_data['xyzs']['xyzs_mask'].shape[-1] - 2, 3), device=xyzs_prev.device)], dim=2)
+        xyzs_prev = torch.where(pdb_data['is_protein'][:, :, None, None], xyzs_prev, sm_xyzs_t)
+        xyzs_prev = torch.where(pdb_data['is_atomize_protein'][:, :, None, None], sm_xyzs_t, xyzs_prev)
+
+        pdb_data['seq']['msa_latent'][:, 0, :, :70] = xt['seq_xt']
+        pdb_data['seq']['msa_latent'][:, 0, :, 70:140] = xt['seq_xt']
+        pdb_data['seq']['msa_full'][:, 0, :, :70] = xt['seq_xt']
+        pdb_data['template']['t1d'][:, 0, :, :70] = xt['seq_xt']
+
+        sm_mask = pdb_data['sm_mask']
+        sm_pair_mask = sm_mask[:, None, :] * sm_mask[:, :, None]
+
+        msa_prev = None
+        pair_prev = None
+        state_prev = None
+        recycle_iters = max(n_cycle - 1, 0)
+        for _ in range(recycle_iters):
+            msa_prev, pair_prev, state_prev, _, _ = model(
+                t=xt['t'], msa_latent=pdb_data['seq']['msa_latent'], msa_full=pdb_data['seq']['msa_full'], seq=xt['seq_token_xt'],
+                seq1hot=xt['seq_xt'], bond_noisy=xt['bond_xt_logtis'], xyz=xyzs_prev, alpha=xt['chi_t'], idx=pdb_data['idx'], bond_feats=xt['bond_xt'],
+                dist_matrix=pdb_data['dist_matrix'], t1d=pdb_data['template']['t1d'], t2d=pdb_data['template']['t2d'],
+                alpha_t=pdb_data['template']['alpha_t'], xyz_t=pdb_data['template']['xyz_t'][:, :, :, 1],
+                mask_t=pdb_data['template']['mask_t_2d'], sm_mask=sm_mask, is_protein=pdb_data['is_protein'],
+                is_atomize_protein=pdb_data['is_atomize_protein'], atom_frames=pdb_data['atom_frames'],
+                same_chain=pdb_data['same_chain'], msa_prev=msa_prev, pair_prev=pair_prev, state_prev=state_prev,
+                mol_props=mol_props, return_raw=True, topk_crop=config['model']['topk_crop'], p2p_crop=config['train']['p2p_crop'])
+
+        with autocast(enabled=True, dtype=torch.bfloat16):
+            logits_c6d, logits_aa, bond_logits_symm, xyz, alpha_s, logits_plddt = model(
+                t=xt['t'], msa_latent=pdb_data['seq']['msa_latent'], msa_full=pdb_data['seq']['msa_full'],
+                seq=xt['seq_token_xt'], seq1hot=xt['seq_xt'], bond_noisy=xt['bond_xt_logtis'], xyz=xyzs_prev, alpha=xt['chi_t'], idx=pdb_data['idx'],
+                bond_feats=xt['bond_xt'], dist_matrix=pdb_data['dist_matrix'], t1d=pdb_data['template']['t1d'],
+                t2d=pdb_data['template']['t2d'], alpha_t=pdb_data['template']['alpha_t'], xyz_t=pdb_data['template']['xyz_t'][:, :, :, 1],
+                mask_t=pdb_data['template']['mask_t_2d'], sm_mask=sm_mask, is_protein=pdb_data['is_protein'],
+                is_atomize_protein=pdb_data['is_atomize_protein'], atom_frames=pdb_data['atom_frames'],
+                same_chain=pdb_data['same_chain'], msa_prev=msa_prev, pair_prev=pair_prev,
+                state_prev=state_prev, mol_props=mol_props, topk_crop=config['model']['topk_crop'], p2p_crop=config['train']['p2p_crop'])
+
+            I, B, L, _, _ = xyz.shape
+            norm_scale = 1 - torch.min(
+                xt['t'][..., None],
+                xt['t'].new_tensor(config['model']['interpolant']['t_normalization_clip'])
+            )[0, 0]
+
+            logits_aa = logits_aa.permute(0, 2, 1)
+            sm_token_loss = F.cross_entropy(logits_aa.view(-1, logits_aa.shape[-1]), pdb_data['seq']['seq'].view(-1), reduction='none')
+            sm_token_loss = ((sm_token_loss * sm_mask.float().reshape(-1)).reshape(logits_aa.shape[0], logits_aa.shape[1]).sum(1) /
+                             (sm_mask.sum(1) + 1e-8)).mean()
+
+            ligand_len = sm_mask.sum().item()
+            bond_logits_symm = bond_logits_symm[sm_pair_mask].reshape(B, ligand_len, ligand_len, NBTYPES)
+            bond_true = pdb_data['bond_feats'][sm_pair_mask].reshape(B, ligand_len, ligand_len)
+            tri_mask = torch.triu(torch.ones(ligand_len, ligand_len, device=local_rank), diagonal=1).unsqueeze(0)
+            bond_loss = loss.focal_loss_multiclass(bond_logits_symm[tri_mask.bool()], bond_true[tri_mask.bool()], gamma=3.)
+
+            predRs_all, pred_allatom = atom_coords_converter.compute_all_atom(pdb_data['seq']['seq'], xyz[-1], alpha_s[-1])
+            natRs_all, _n0 = atom_coords_converter.compute_all_atom(pdb_data['seq']['seq'], pdb_data['xyzs']['xyzs_true'][..., :3],
+                                                                    pdb_data['xyzs']['torsion_angle_true'], non_ideal=True)
+            natRs_all_alt, _n1 = atom_coords_converter.compute_all_atom(pdb_data['seq']['seq'], pdb_data['xyzs']['xyzs_true'][..., :3],
+                                                                        pdb_data['xyzs']['torsion_angle_alt_true'], non_ideal=True)
+            natRs_all_symm, nat_symm = loss.resolve_symmetry(pred_allatom[-1], natRs_all[0], pdb_data['xyzs']['xyzs_true'][0],
+                                                             natRs_all_alt[0], pdb_data['xyzs']['xyzs_true_alt'][0], pdb_data['xyzs']['xyzs_mask'][0])
+            nat_symm[~mask_protein_BB[0], :, :3] = pdb_data['xyzs']['xyzs_true'][:, ~mask_protein_BB[0], :, :3]
+
+            N_pred, Ca_pred, C_pred = xyz[:, :, :, 0], xyz[:, :, :, 1], xyz[:, :, :, 2]
+            R_pred, T_pred = utils.rigid_from_3_points(N_pred.reshape(I * B, L, 3), Ca_pred.reshape(I * B, L, 3), C_pred.reshape(I * B, L, 3))
+            R_pred = R_pred.reshape(I, B, L, 3, 3)
+            T_pred = T_pred.reshape(I, B, L, 3)
+            protein_frame_distance_loss, trans_err, rots_err = loss.frame_distance_loss(R_pred[:, :, pdb_data['is_protein'][0]],
+                                                                                        T_pred[:, :, pdb_data['is_protein'][0]],
+                                                                                        pdb_data['xyzs']['xyzs_true_rots'][:, pdb_data['is_protein'][0]],
+                                                                                        pdb_data['xyzs']['xyzs_true_trans'][:, pdb_data['is_protein'][0]],
+                                                                                        mask_protein_BB[:, pdb_data['is_protein'][0]],
+                                                                                        gamma=config.train.loss_weight.gamma)
+            tors_loss = loss.torsionAngleLoss(alpha_s, pdb_data['xyzs']['torsion_angle_true'], pdb_data['xyzs']['torsion_angle_alt_true'],
+                                              pdb_data['xyzs']['torsion_mask'], pdb_data['xyzs']['planar'])
+
+            ligand_mask = torch.where(pdb_data['is_atomize_protein'], True, ~pdb_data['is_protein'])
+            pred_ligand = xyz[:, ligand_mask, :, 1].reshape(I, B, -1, 3)
+            true_ligand = pdb_data['xyzs']['xyzs_true'][ligand_mask, :, 1].reshape(B, -1, 3)
+            ligand_coords_loss = loss.calc_ligand_coord_loss(pred_ligand, true_ligand, ligand_mask[ligand_mask].reshape(B, -1),
+                                                             gamma=config.train.loss_weight.gamma)
+
+            protein_contact_mask = pdb_data['is_pocket_mask'] & pdb_data['is_protein'] & mask_protein_BB
+            protein_ligand_contact_loss = loss.calc_protein_ligand_contact_loss(
+                pred_allatom, pdb_data['xyzs']['xyzs_true'], pdb_data['xyzs']['xyzs_mask'],
+                protein_contact_mask, ligand_mask
+            )
+
+            mask = (pdb_data['xyzs']['xyzs_mask'][:, :, 1] == 1.0)
+            pair_mask = mask[:, None, :] * mask[..., None]
+            c6d_loss = loss.calc_c6d_loss(logits_c6d, pdb_data['xyzs']['c6d'].long(), pair_mask)
+            lddt, plddt, plddt_loss = loss.calc_allatom_lddt_loss(pred_allatom[:, :, :14].detach(), nat_symm[:, :14],
+                                                                  logits_plddt, pdb_data['idx'], pdb_data['xyzs']['xyzs_mask'][:, :, :14],
+                                                                  pair_mask, pdb_data['same_chain'], N_stripe=10)
+
+            aux_loss = loss_weight.protein_ligand_contact * protein_ligand_contact_loss
+
+            total_loss = (loss_weight.sm_token * sm_token_loss + loss_weight.bond_token * bond_loss + loss_weight.tors * tors_loss / norm_scale +
+                          loss_weight.frame_distance * protein_frame_distance_loss / norm_scale + loss_weight.ligand_coords * ligand_coords_loss / norm_scale +
+                          loss_weight.c6d * c6d_loss + loss_weight.plddt * plddt_loss + aux_loss)
+
+        metric_sums += torch.stack([
+            total_loss.detach(), sm_token_loss.detach(), bond_loss.detach(), trans_err.detach(), rots_err.detach(),
+            tors_loss.detach(), ligand_coords_loss.detach(), protein_ligand_contact_loss.detach(), c6d_loss.detach(),
+            lddt.detach(), plddt.detach(), plddt_loss.detach()
+        ]) * B
+        sample_count += B
+
+    reduced = torch.cat([metric_sums, sample_count[None]])
+    dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+    metric_sums = reduced[:-1]
+    sample_count = reduced[-1].clamp_min(1.0)
+
+    if local_rank == 0:
+        for name, value in zip(metric_names, metric_sums / sample_count):
+            writer.add_scalar("valid/%s" % name, value.item(), log_steps)
+
+    model.train()
+
+
 def train(local_rank):
     config, config_name = utils.load_config('./config/base_config.yaml')
     loss_weight = config.train.loss_weight
@@ -98,7 +247,7 @@ def train(local_rank):
     dist.barrier()
 
     dataset = Apo2HoloDataset(base_path=config['dataset']['base_path'], apo_path=config['dataset']['apo_path'],
-                              holo_path=config['dataset']['holo_path'], holo_list_path=config['dataset']['base_path'] + '/use_holo_ids_filter_mw.pkl',
+                              holo_path=config['dataset']['holo_path'], holo_list_path=config['dataset']['base_path'] + '/train_ids_filter_mw_find_time.pkl',
                               n_crop=config['train']['n_crop'], atomize_protein=config['model']['atomize_protein'],
                               crop_strategy=config['train']['crop_strategy'])
     sampler = DistributedSampler(dataset, shuffle=True, num_replicas=WORLD_SIZE, rank=local_rank)  # 分布式采样器
@@ -110,6 +259,14 @@ def train(local_rank):
     num_workers = config.train.num_workers
     dataloader = DataLoader(dataset, batch_size=config.train.mini_batch_size, pin_memory=True, persistent_workers=True,
                             num_workers=num_workers, prefetch_factor=config.train.pseudo_batch_size, sampler=sampler)
+    valid_dataset = Apo2HoloDataset(base_path=config['dataset']['base_path'], apo_path=config['dataset']['apo_path'],
+                                    holo_path=config['dataset']['holo_path'], holo_list_path=config['dataset']['base_path'] + '/valid_ids_filter_mw_find_time.pkl',
+                                    n_crop=config['train']['n_crop'], atomize_protein=config['model']['atomize_protein'],
+                                    crop_strategy=config['train']['crop_strategy'])
+    valid_sampler = DistributedSampler(valid_dataset, shuffle=False, num_replicas=WORLD_SIZE, rank=local_rank)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=config.train.mini_batch_size, pin_memory=True,
+                                  persistent_workers=True, num_workers=num_workers, prefetch_factor=2,
+                                  sampler=valid_sampler)
 
     if local_rank == 0:
         writer = SummaryWriter(log_dir='./logs/%s' % log_name)
@@ -470,6 +627,12 @@ def train(local_rank):
 
         # 可能存在部分进程反向传播了一些数据，因此这里需要清除梯度信息
         optimizer.zero_grad()
+        if local_rank == 0:
+            pbar.clear()
+            pbar.close()
+
+        validate(model, valid_dataloader, interpolant, atom_coords_converter, config, local_rank, writer, log_steps)
+
         # 保存断点
         if local_rank == 0:
             save_dict = {
@@ -484,8 +647,6 @@ def train(local_rank):
                 'cuda_rng_state': torch.cuda.get_rng_state_all(),
             }
             torch.save(save_dict, './save_model/checkpoint.ckpt')
-            pbar.clear()
-            pbar.close()
         # 等待所有进程完成epoch
         dist.barrier()
 

@@ -20,7 +20,7 @@ from model.utils.util_module import XYZConverter_loader
 from model.utils.geometry import construct_3d_basis, align, rot_matrix_to_quat
 
 # 动态添加 SA_Score 等 Contrib 模块所在的目录
-sys.path.append('/root/miniconda3/envs/APO2MolFlow/share/RDKit/Contrib/SA_Score')
+sys.path.append('/home/luozhenjie/.conda/envs/APO2MolFlow/share/RDKit/Contrib/SA_Score')
 import sascorer
 
 lg = RDLogger.logger()

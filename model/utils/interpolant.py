@@ -14,16 +14,28 @@ class Interpolant(nn.Module):
     构建的路径包括：apo到holo的SE(3)、侧链扭转角路径；小分子配体的从先验分布（高斯）到真实配体的路径
     """
 
-    def __init__(self, T=1., trans_scale=10., seq_noise_scale=1.0, seq_max_temp=10., decay=3., device='cpu'):
+    def __init__(self, T=1., trans_scale=10., min_t=1e-3,
+                 seq_noise_scale=1.0, seq_max_temp=10., decay=3.,
+                 atom_noise_scale=0.8, atom_max_temp=8.0, atom_decay=4.0,
+                 bond_noise_scale=0.5, bond_max_temp=3.0, bond_decay=5.0,
+                 device='cpu', **akwags):
         super(Interpolant, self).__init__()
 
         self.T = T
 
         self.trans_scale = trans_scale
+        self.min_t = min_t
 
         self.seq_noise_scale = seq_noise_scale
         self.seq_max_temp = seq_max_temp
         self.decay = decay
+        # 原子类型和化学键类型的离散分布不同，因此使用独立的加噪与退火参数。
+        self.atom_noise_scale = atom_noise_scale
+        self.atom_max_temp = atom_max_temp
+        self.atom_decay = atom_decay
+        self.bond_noise_scale = bond_noise_scale
+        self.bond_max_temp = bond_max_temp
+        self.bond_decay = bond_decay
 
         self.device = device
 
@@ -39,8 +51,8 @@ class Interpolant(nn.Module):
         offset = torch.arange(batch_size, device=self.device) / batch_size  # 计算采样时间步之间的间隔
         # 确保每个采样时间步在[0, 1)区间内均匀分布，提高训练稳定性
         eps_t = ((eps_t / batch_size) + offset) % 1
-        # 确保值不是精确的0或1
-        t = (1 - 1e-3) * eps_t + 1e-3
+        # 确保值不是精确的0或1，并使用配置中的最小时间步。
+        t = (1 - self.min_t) * eps_t + self.min_t
         return t
 
     def _zero_center_part(self, pos, gen_mask, res_mask):
@@ -141,27 +153,32 @@ class Interpolant(nn.Module):
         ligand_coords_t = (1 - t[..., None]) * ligand_coords_0 + t[..., None] * ligand_coords_1
         return ligand_coords_t
 
-    def _interpolate_seq(self, seq1hot, t, mask=None, eps=1e-20):
+    def _interpolate_seq(self, seq1hot, t, mask=None, noise_scale=None, max_temp=None, decay=None, eps=1e-20):
         def _onehot_to_clamped(seq_one_hot, eps=1e-5):
             return torch.clamp(seq_one_hot, min=eps, max=1.0)
 
         def _temperature_function(expanded_t, decay_rates=None):
             if decay_rates is not None:
                 assert decay_rates.shape == expanded_t.shape, "shape mismatch"
-                self.seq_max_temp * torch.exp(-decay_rates * expanded_t)
-            return self.seq_max_temp * torch.exp(-self.decay * expanded_t)
+                return max_temp * torch.exp(-decay_rates * expanded_t)
+            return max_temp * torch.exp(-decay * expanded_t)
 
         """
         根据《Gumbel-Softmax Flow Matching with Straight-Through Guidance for Controllable Biological Sequence Generation》提到的方法给离散token插值。
         根据时间步 t 注入随机噪声，并转化为一种“模糊”的概率分布状态。
         """
+        noise_scale = self.seq_noise_scale if noise_scale is None else noise_scale
+        max_temp = self.seq_max_temp if max_temp is None else max_temp
+        decay = self.decay if decay is None else decay
         B, L, V = seq1hot.shape
 
         expanded_t = t.unsqueeze(-1).unsqueeze(-1).expand(B, L, V)  # 插值时间步
-        logits = _onehot_to_clamped(seq1hot)  # 确保数值均为正数，并且不大于1，主要用途是确保数值稳定
+        logits = torch.log(_onehot_to_clamped(seq1hot.float()))  # 将概率转为log-prob，避免Gumbel噪声淹没真实类别
         # Gumbel噪声生成。Gumbel噪声是专门为离散分类分布设计的
-        U = torch.rand(B, L, V, device=self.device)
-        gumbel_noise = -torch.log(-torch.log(U / self.seq_noise_scale + eps) + eps)
+        rand_eps = max(eps, torch.finfo(logits.dtype).eps)
+        U = torch.rand_like(logits).clamp(min=rand_eps, max=1.0 - rand_eps)
+        gumbel_noise = -torch.log(-torch.log(U))
+        gumbel_noise = noise_scale * gumbel_noise
         temp = _temperature_function(expanded_t)  # 温度随时间步变化，用以控制噪声强度
 
         xt = (logits + gumbel_noise) / temp  # 添加噪声并缩放
@@ -215,13 +232,19 @@ class Interpolant(nn.Module):
         token_mask = torch.where(batch['is_atomize_protein'], True, batch['is_protein'])
 
         # 序列部分插值。需要注意蛋白质部分的token无需插值
-        xt, xt_seq, temp = self._interpolate_seq(seq_batch['seq1hot'], t, mask=~batch['is_protein'])
+        xt, xt_seq, temp = self._interpolate_seq(
+            seq_batch['seq1hot'], t, mask=~batch['is_protein'],
+            noise_scale=self.atom_noise_scale, max_temp=self.atom_max_temp, decay=self.atom_decay
+        )
         xt = torch.where(token_mask[..., None], seq_batch['seq1hot'], xt)  # 将蛋白质部分还原
         xt_seq = torch.where(token_mask, seq_batch['seq'], xt_seq)
 
         # 化学键部分插值。需要注意蛋白质部分的键以及原子化残基的化学键无需插值
         bond_feats_onehot = nn.functional.one_hot(batch['bond_feats'], num_classes=NBTYPES)
-        xt_bond_logits, xt_bond_feats, temp = self._interpolate_seq(bond_feats_onehot.reshape(B, L * L, -1), t)
+        xt_bond_logits, xt_bond_feats, temp = self._interpolate_seq(
+            bond_feats_onehot.reshape(B, L * L, -1), t,
+            noise_scale=self.bond_noise_scale, max_temp=self.bond_max_temp, decay=self.bond_decay
+        )
         xt_bond_feats = xt_bond_feats.reshape(B, L, L)  # [B, L, L]
         xt_bond_logits = xt_bond_logits.reshape(B, L, L, NBTYPES)  # [B, L, L, NBTYPES]
         xt_bond_feats = torch.where(token_mask[..., None] * token_mask[:, None, :], batch['bond_feats'], xt_bond_feats)  # 将蛋白质部分还原

@@ -60,7 +60,6 @@ rdkit_bond_type_lookup = {
 RES_NB_JUMP = 50  # 链间索引跳号
 
 
-
 def load_config(config_path):
     with open(config_path, 'r') as f:
         config = EasyDict(yaml.safe_load(f))

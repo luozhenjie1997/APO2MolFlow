@@ -46,16 +46,22 @@ model:
   n_cycle: 4
   interpolant:
     min_t: 1.e-2
+    atom_noise_scale: 0.8
+    atom_max_temp: 8.0
+    atom_decay: 4.0
+    bond_noise_scale: 0.5
+    bond_max_temp: 3.0
+    bond_decay: 5.0
     t_normalization_clip: 0.9
-    position_scale: 0.25  # 是否需要缩放？
+#    position_scale: 0.25  # 是否需要缩放？
 
 dataset:
-  base_path: /root/autodl-tmp/dataset/APO2MolFlow
-  PDBBind_path: /root/autodl-tmp/dataset/PDBbind+
-  Q_BioLip_path: /root/autodl-tmp/dataset/Q-BioLiP
-  apo_holo_dict: /root/autodl-tmp/dataset/APO2MolFlow/use_single_apo_holo_dict.pkl
-  holo_path: /root/autodl-tmp/dataset/APO2MolFlow/holo
-  apo_path: /root/autodl-tmp/dataset/APO2MolFlow/apo
+  base_path: /data1/luozhenjie/dataset/APO2MolFlow
+  PDBBind_path: /data1/luozhenjie/dataset/PDBbind+
+  Q_BioLip_path: /data1/luozhenjie/dataset/Q-BioLiP
+  apo_holo_dict: /data1/luozhenjie/dataset/APO2MolFlow/use_single_apo_holo_dict.pkl
+  holo_path: /data1/luozhenjie/dataset/APO2MolFlow/holo
+  apo_path: /data1/luozhenjie/dataset/APO2MolFlow/apo
 
 train:
   seed: 2026
@@ -67,14 +73,14 @@ train:
   # distance：裁剪会强烈偏向口袋附近残基
   crop_strategy: random_non_pocket
   epochs: 100
-  gpu_nums: 4
+  gpu_nums: 8
   batch_size: 32
-  pseudo_batch_size: 8
+  pseudo_batch_size: 4
   mini_batch_size: 1
   l2_coeff: 1.e-2
   lr: 5.e-4
   grad_clip: 0.2
-  rfaa_weight_pth: /root/pytorch_checkpoint/RFAA_paper_weights.pt
+  rfaa_weight_pth: /data1/luozhenjie/pytorch_checkpoint/RFAA_paper_weights.pt
   predict_weight: 0.3
   use_aux_loss: 0.5
   loss_weight:

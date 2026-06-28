@@ -46,7 +46,7 @@ def setup_distributed():
     torch.cuda.set_device(LOCAL_RANK)  # 绑定当前进程到对应GPU
 
 
-@torch.no_grad()
+@torch.no_grad()  # 评估函数不执行任何反向传播
 def validate(model, dataloader, interpolant, atom_coords_converter, config, local_rank, writer, log_steps):
     """
     在验证集上评估当前训练目标。验证时固定t=0.5，减少随机时间步带来的曲线抖动。
@@ -199,7 +199,7 @@ def train(local_rank):
     config, config_name = utils.load_config('./config/base_config.yaml')
     loss_weight = config.train.loss_weight
 
-    utils.set_seed(config.train.seed + local_rank)
+    utils.set_seed(config.train.seed + local_rank + 1)
     accumulation_steps = config.train.pseudo_batch_size // config.train.mini_batch_size
     # loss_weight = config.train.loss_weight
 
@@ -214,7 +214,7 @@ def train(local_rank):
     optimizer = apex.optimizers.FusedAdam(param_group, lr=config.train.lr, set_grad_none=True)
     scheduler = get_stepwise_decay_schedule_with_warmup(optimizer, 0, 2000, 0.95)
 
-    interpolant = Interpolant(device=local_rank).to(local_rank)  # 用于对数据进行插值
+    interpolant = Interpolant(**config.model.interpolant, device=local_rank).to(local_rank)  # 用于对数据进行插值
     # 计算所有原子坐标的工具
     atom_coords_converter = util_module.XYZConverter().to(local_rank)
 
@@ -229,6 +229,7 @@ def train(local_rank):
         except ValueError as exc:
             if local_rank == 0:
                 print("Skip optimizer state loading because model parameters changed: %s" % exc)
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         epoch = checkpoint['epoch']
         log_name = checkpoint['log_name']
         log_steps = checkpoint['log_steps']

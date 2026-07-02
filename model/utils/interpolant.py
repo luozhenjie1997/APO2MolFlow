@@ -6,7 +6,7 @@ from scipy.optimize import linear_sum_assignment
 from torch_geometric.utils import scatter
 from torch_scatter import scatter_add, scatter
 from .so3.dist import uniform_so3
-from .chemical import NBTYPES
+from .chemical import NAATOKENS, NNAPROTAAS, NBTYPES
 
 class Interpolant(nn.Module):
     """
@@ -41,6 +41,86 @@ class Interpolant(nn.Module):
 
         self.to_numpy = lambda x: x.detach().cpu().numpy()
 
+    def _get_ligand_atom_uniform_prior(self, device, dtype):
+        """
+        获取合法配体元素token子空间上的均匀初始分布。
+        """
+        prior = torch.zeros(NAATOKENS, device=device, dtype=dtype)
+        prior[NNAPROTAAS:NAATOKENS - 1] = 1.0  # 排除氨基酸token和ATM占位符
+        return prior / prior.sum().clamp_min(1e-8)
+
+    def _get_ligand_bond_uniform_prior(self, device, dtype):
+        """
+        获取合法配体键类型子空间上的均匀初始分布。
+        """
+        prior = torch.zeros(NBTYPES, device=device, dtype=dtype)
+        ligand_bond_type_count = min(5, NBTYPES)
+        prior[:ligand_bond_type_count] = 1.0  # 无键/单键/双键/三键/芳香键
+        return prior / prior.sum().clamp_min(1e-8)
+
+    def get_element_type_x0(self, batch, ligand_mask=None):
+        """
+        构建元素类型x0。蛋白和原子化蛋白残基保持原token，待生成配体原子从合法元素子空间初始化。
+        """
+        seq_batch = batch['seq']
+        seq1hot = seq_batch['seq1hot']
+        seq = seq_batch['seq']
+        device = seq1hot.device
+
+        if ligand_mask is None:
+            ligand_mask = (~batch['is_protein']) & (~batch['is_atomize_protein'])
+        ligand_mask = ligand_mask.to(device=device, dtype=torch.bool)
+
+        seq_x0 = seq1hot.float().clone()
+        seq_token_x0 = seq.clone()
+        prior = self._get_ligand_atom_uniform_prior(device=device, dtype=seq_x0.dtype)
+
+        num_ligand_atoms = int(ligand_mask.sum().item())
+        if num_ligand_atoms > 0:
+            sampled_tokens = torch.multinomial(prior, num_samples=num_ligand_atoms, replacement=True)
+            seq_x0[ligand_mask] = prior
+            seq_token_x0[ligand_mask] = sampled_tokens.to(seq_token_x0.dtype)
+
+        return seq_x0, seq_token_x0
+
+    def get_bond_type_x0(self, batch, ligand_mask=None):
+        """
+        构建化学键类型x0。只对ligand_mask指定的配体内部pair做均匀初始化，其余pair保持原值。
+        """
+        bond_feats = batch['bond_feats']
+        device = bond_feats.device
+        if ligand_mask is None:
+            ligand_mask = (~batch['is_protein']) & (~batch['is_atomize_protein'])
+        ligand_mask = ligand_mask.to(device=device, dtype=torch.bool)
+
+        ligand_pair_mask = ligand_mask[..., None] & ligand_mask[:, None, :]
+        fixed_pair_mask = ~ligand_pair_mask
+
+        bond_prior = self._get_ligand_bond_uniform_prior(device=device, dtype=torch.float32)
+
+        bond_x0_probs = bond_prior.view(1, 1, 1, NBTYPES).expand(*bond_feats.shape, NBTYPES).clone()
+        bond_x0 = torch.multinomial(bond_prior, num_samples=bond_feats.numel(), replacement=True).view_as(bond_feats)
+        bond_x0 = torch.triu(bond_x0, diagonal=1)
+        bond_x0 = bond_x0 + bond_x0.transpose(-1, -2)  # 化学键矩阵需要保持对称，且对角线为NO_BOND
+
+        bond_feats_onehot = nn.functional.one_hot(bond_feats, num_classes=NBTYPES).to(bond_x0_probs.dtype)
+        bond_x0_probs = torch.where(fixed_pair_mask[..., None], bond_feats_onehot, bond_x0_probs)
+        bond_x0 = torch.where(fixed_pair_mask, bond_feats, bond_x0)
+        return bond_x0_probs, bond_x0
+
+    def get_discrete_x0(self, batch, ligand_mask=None):
+        """
+        一次性获取推理初始的元素类型x0和化学键x0。
+        """
+        seq_x0, seq_token_x0 = self.get_element_type_x0(batch, ligand_mask=ligand_mask)
+        bond_x0_probs, bond_x0 = self.get_bond_type_x0(batch, ligand_mask=ligand_mask)
+        return {
+            'seq_x0': seq_x0,
+            'seq_token_x0': seq_token_x0,
+            'bond_x0': bond_x0,
+            'bond_x0_logits': bond_x0_probs,
+            'bond_x0_logtis': bond_x0_probs,
+        }
 
     def _sample_t(self, batch_size):
         """
@@ -154,9 +234,6 @@ class Interpolant(nn.Module):
         return ligand_coords_t
 
     def _interpolate_seq(self, seq1hot, t, mask=None, noise_scale=None, max_temp=None, decay=None, eps=1e-20):
-        def _onehot_to_clamped(seq_one_hot, eps=1e-5):
-            return torch.clamp(seq_one_hot, min=eps, max=1.0)
-
         def _temperature_function(expanded_t, decay_rates=None):
             if decay_rates is not None:
                 assert decay_rates.shape == expanded_t.shape, "shape mismatch"
@@ -173,7 +250,7 @@ class Interpolant(nn.Module):
         B, L, V = seq1hot.shape
 
         expanded_t = t.unsqueeze(-1).unsqueeze(-1).expand(B, L, V)  # 插值时间步
-        logits = torch.log(_onehot_to_clamped(seq1hot.float()))  # 将概率转为log-prob，避免Gumbel噪声淹没真实类别
+        logits = seq1hot.float()  # 论文公式中的delta_ik：目标类别为1，其他类别为0
         # Gumbel噪声生成。Gumbel噪声是专门为离散分类分布设计的
         rand_eps = max(eps, torch.finfo(logits.dtype).eps)
         U = torch.rand_like(logits).clamp(min=rand_eps, max=1.0 - rand_eps)

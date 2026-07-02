@@ -47,7 +47,7 @@ def setup_distributed():
 
 
 @torch.no_grad()  # 评估函数不执行任何反向传播
-def validate(model, dataloader, interpolant, atom_coords_converter, config, local_rank, writer, log_steps):
+def validate(model, dataloader, interpolant, atom_coords_converter, config, local_rank, writer, valid_log_steps):
     """
     在验证集上评估当前训练目标。验证时固定t=0.5，减少随机时间步带来的曲线抖动。
     """
@@ -190,7 +190,7 @@ def validate(model, dataloader, interpolant, atom_coords_converter, config, loca
 
     if local_rank == 0:
         for name, value in zip(metric_names, metric_sums / sample_count):
-            writer.add_scalar("valid/%s" % name, value.item(), log_steps)
+            writer.add_scalar("valid/%s" % name, value.item(), valid_log_steps)
 
     model.train()
 
@@ -199,7 +199,7 @@ def train(local_rank):
     config, config_name = utils.load_config('./config/base_config.yaml')
     loss_weight = config.train.loss_weight
 
-    utils.set_seed(config.train.seed + local_rank + 1)
+    utils.set_seed(config.train.seed + local_rank)
     accumulation_steps = config.train.pseudo_batch_size // config.train.mini_batch_size
     # loss_weight = config.train.loss_weight
 
@@ -233,6 +233,7 @@ def train(local_rank):
         epoch = checkpoint['epoch']
         log_name = checkpoint['log_name']
         log_steps = checkpoint['log_steps']
+        valid_log_steps = checkpoint.get('valid_log_steps', epoch + 2)
         # random.setstate(checkpoint['random_state'])
         # torch.set_rng_state(checkpoint['rng_state'])  # 恢复CPU随机状态
         # torch.cuda.set_rng_state_all(checkpoint['cuda_rng_state'])  # 恢复所有GPU的随机状态
@@ -241,6 +242,7 @@ def train(local_rank):
         model = utils.load_rfaa_weights_without_nucleic_acids(model, config['train']['rfaa_weight_pth'])  # 继承RFAA的权重
         epoch = 0
         log_steps = 1
+        valid_log_steps = 1
         log_name = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
     # model = torch.compile(model)
@@ -632,7 +634,8 @@ def train(local_rank):
             pbar.clear()
             pbar.close()
 
-        validate(model, valid_dataloader, interpolant, atom_coords_converter, config, local_rank, writer, log_steps)
+        validate(model, valid_dataloader, interpolant, atom_coords_converter, config, local_rank, writer, valid_log_steps)
+        valid_log_steps += 1
 
         # 保存断点
         if local_rank == 0:
@@ -643,6 +646,7 @@ def train(local_rank):
                 "epoch": e,
                 'log_name': log_name,
                 'log_steps': log_steps,
+                'valid_log_steps': valid_log_steps,
                 'random_state': random.getstate(),
                 'rng_state': torch.get_rng_state(),
                 'cuda_rng_state': torch.cuda.get_rng_state_all(),
